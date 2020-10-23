@@ -85,15 +85,15 @@ proc get_schema*(pg: DBConn): JsonNode =
   result = %* tables
 
 proc extractJSonVal(c: DbColumn, item: JsonNode): string =
-    case c.ctype:
-    of "int", "integer", "bigint", "smallint":
-      result = $item[c.name].getInt()
-    of "boolean":
-      result = $item[c.name].getBool()
-    of "numeric", "double precision":
-      result = $item[c.name].getFloat
-    else:
-      result = dbQuote(item[c.name].getStr())
+  case c.ctype
+  of "int", "integer", "bigint", "smallint":
+    result = $item[c.name].getInt()
+  of "boolean":
+    result = $item[c.name].getBool()
+  of "numeric", "double precision":
+    result = $item[c.name].getFloat
+  else:
+    result = dbQuote(item[c.name].getStr())
   
 proc get_data*(pg:DbConn, db_table: string, ctx: WebContext = nil, schema = "public"): JsonNode =
   ## Given a table and a query, returns a JsonNode containing the result.
@@ -126,9 +126,10 @@ proc get_data*(pg:DbConn, db_table: string, ctx: WebContext = nil, schema = "pub
     result = parseJson($rows[0][0])
   else:
     result = %*{"message": "No rows found"}
-
-proc get_data*(pg:DbConn, queryVars: JsonNode, schema = "public"): JsonNode =
+               
+proc get_data*(pg:DbConn, queryVars: JsonNode, schema = "public", count=false): JsonNode =
   # Use json to construct the query
+  # uses a where to compare values
   let db_schema = pg.get_tables(schema)
   var whereClause = ""
   if queryVars != nil:
@@ -136,10 +137,14 @@ proc get_data*(pg:DbConn, queryVars: JsonNode, schema = "public"): JsonNode =
     var qvTables: seq[string] = @[]
     for k in queryVars.keys():
       qvTables.add k
-    # FIXME:
     for db_table in qvTables:
-      let tables = db_schema.filter do (t:DBTable) -> bool : t.name == db_table
-      var columns = initTable[string, DbColumn]() # seq[DBColumn]
+      # let tables = db_schema.filter do (t:DBTable) -> bool: t.name == db_table
+      var tables: seq[DBTable]
+      for t in db_schema:
+        if t.name == db_table:
+          tables.add t
+      
+      var columns = initTable[string, DbColumn]()
       if tables.len > 0:
         for column in tables[0].columns:
           columns[column.name] = column
@@ -157,9 +162,10 @@ proc get_data*(pg:DbConn, queryVars: JsonNode, schema = "public"): JsonNode =
             whereClause.add(key & " = '" & val & "' and ")
             whereClause.delete(whereClause.len - 4, whereClause.len - 1)
         # FIXME: exclude where if there are no values
+            
       var statement = "select to_json(k) from (select array_to_json(array_agg(row_to_json(j))) as " &
         db_table & " from (select * from " & schema & "." & db_table & whereClause & " ) j) k"
-      echo statement
+
       let rows = pg.getAllRows(sql(statement))
       if rows[0].len > 0:
         result{"data", db_table} = parseJson($rows[0][0])[db_table]
@@ -171,17 +177,10 @@ proc get_data*(pg:DbConn, queryVars: JsonNode, schema = "public"): JsonNode =
 proc genSQLValue(c: DbColumn, item: JsonNode): string =
   result = extractJSonVal(c, item) & ", "
 
-proc genValuesClause(pg:DbConn, db_table: string, d: JsonNode,
+proc genValuesClause(pg:DbConn, db_table: string, d: JsonNode, schema="public",
                      insertNull = true): (seq[seq[string]], seq[string]) =
-  ## Generates a sql statement for insertion
-  ## data is:
-  ## {"data": [ {<data item>}, {<data item>}, ...] }
-  ##
-  ## Fields not present in the data item are leaved for the table's default
-  ##
-  ## Fields not existing in the database are silently ignored
-  ## Returns statment, affected rows
-  let db_schema = pg.get_tables()
+  ## Generates the `values` part of the sql statement.
+  let db_schema = pg.get_tables(schema)
   if d.kind == JObject:
     for k, v in d:
       #var insertColumns: seq[DBColumn] # the columns to be inserted
@@ -206,8 +205,9 @@ proc genValuesClause(pg:DbConn, db_table: string, d: JsonNode,
                 ic.add c
             elif item.haskey(c.name):
               if not ic.contains c:
-                ic.add c  
-            values = values & genSQLValue(c, item)
+                ic.add c
+              values = values & genSQLValue(c, item)
+            
           values.delete(values.len - 2, values.len)
           values = values & " )"
           vals.add values
@@ -217,7 +217,7 @@ proc genValuesClause(pg:DbConn, db_table: string, d: JsonNode,
           insertColumns.add cols
         result = (insertColumns, vals)
         
-proc post_data*(pg:DbConn, db_table: string, d: JsonNode, insertNull = true): JsonNode =
+proc post_data*(pg:DbConn, db_table: string, d: JsonNode, schema="public", insertNull = true): JsonNode =
   ## Inserts the contents of a JsonNode into a table. the format of the Json
   ## data is:
   ##
@@ -228,25 +228,29 @@ proc post_data*(pg:DbConn, db_table: string, d: JsonNode, insertNull = true): Js
   ##
   ## Fields not existing in the database are silently ignored
   echo "\n\n---------\nDATA:" & $d
-  let valClause = genValuesClause(pg, db_table, d, insertNull)
-  
+  let valClause = genValuesClause(pg, db_table, d, schema, insertNull)
+    
   if valClause[0].len > 0:
-    # TODO: if not null then make individual inserts
-    var query = "INSERT INTO " & db_table & " (" & valClause[0][0].join(", ")
+    var query = ""
+    if schema != "public":
+      query = fmt"""INSERT INTO {schema}.{db_table} ({valClause[0][0].join(", ")}"""
+    else:
+      query = fmt"""INSERT INTO {db_table} ({valClause[0][0].join(", ")}"""
+    
     query.delete(query.len , query.len)
     query = query & " )"
     query = query & " VALUES " & valClause[1].join(", ")
     query.delete(query.len - 2, query.len)
-    query = query & " )"
-    pg.exec(sql(query))
-    result = %*{ "inserted": valClause[0].len}
+    query = query & " ) RETURNING id"
+    echo "\n"
+    let id = pg.getValue(sql(query))
+    result = %*{"inserted": valClause[0].len, "id": id}
   else:
     result = %*{"error_message": "invalid data"}
                
 proc genSetStmt(pg:DbConn, db_table: string, d: JsonNode, pk: string): seq[string] =
   let
     db_schema = pg.get_tables()
-
   # var
   #   pks: Table[string, string]
   #   pk: string      
@@ -266,12 +270,12 @@ proc genSetStmt(pg:DbConn, db_table: string, d: JsonNode, pk: string): seq[strin
       var
         setClause: string 
         statement: string
-        whereStmt: string
+        whereClause: string
         statements:seq[string] = @[]
       for item in data:
         setClause = ""
         statement = ""
-        whereStmt = ""        
+        whereClause = ""        
         for c in columns:
           if item.haskey(c.name) and item[c.name].kind == JNull:
             # sets to NULL if the column name is passed and its value is JNull
@@ -281,11 +285,11 @@ proc genSetStmt(pg:DbConn, db_table: string, d: JsonNode, pk: string): seq[strin
             setClause = setClause & c.name & " = "
             setClause = setClause & genSQLValue(c, item)
           if pk != "" and c.name == pk:
-            whereStmt =  " WHERE " & db_table & "." & c.name & " = " & extractJSonVal(c, item)
+            whereClause =  " WHERE " & db_table & "." & c.name & " = " & extractJSonVal(c, item)
 
         let lastComma = setClause.rfind(",")
         setClause.delete(lastComma, lastComma + 1)
-        statements.add("SET " & setClause & whereStmt)
+        statements.add("SET " & setClause & whereClause)
       result = statements
     
 proc put_data*(pg:DbConn, db_table: string, d: JsonNode): JsonNode =
@@ -357,7 +361,7 @@ proc delete_data*(pg:DbConn, db_table: string, ctx: WebContext): JsonNode =
   ##
   ## CAUTION!: if no id is given, deletes all rows from the table 
   var statement = "DELETE FROM " & db_table 
-  var whereStmt = ""
+  var whereClause = ""
   if ctx.request.paramList.len > 0:
     statement.add " WHERE id IN ("
     for id in ctx.request.paramList:
