@@ -5,9 +5,9 @@ import noah / asynccontext
 import ../src/autopg
 
 const
-  user = "postgres"
-  password = "postgres"
-  dbname = "postgres"
+  user = "autopg"
+  password = "autopg"
+  dbname = "autopg"
   tableName = "test_autopg"
 
 let
@@ -16,6 +16,7 @@ let
 
 try:
   # Create table
+  echo "creating table"
   const createTableSql =
     """CREATE TABLE IF NOT EXISTS public.test_autopg
       (
@@ -45,7 +46,8 @@ try:
   # Insert data
   echo "Insert"
   let rInsert = db.post_data(tableName, %*{"data": [item, item0]})
-  doAssert($rInsert == """{"inserted":2}""")
+  echo rInsert
+  doAssert(rInsert["inserted"] == %2 and rInsert.haskey("id"))
 
   # Retrieve data
   let rGet = db.get_data(tableName)
